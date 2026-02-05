@@ -1,0 +1,418 @@
+import pandas as pd
+from pandas.api.types import CategoricalDtype
+import numpy as np
+from math import *
+from collections import Counter
+import pickle as pkl
+import argparse
+
+# import scanpy as sc
+# import scvelo as scv
+
+import os
+import sys
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+
+# import scrublet as scr
+import scipy.io
+import matplotlib.pyplot as plt
+
+os.chdir('../')
+
+import re
+
+
+def normalize_patient_id(x):
+    s = str(x).strip()
+
+    # "31 (M)" → "31-M"
+    s = re.sub(r'(\d+)\s*\(([^)]+)\)', r'\1-\2', s)
+
+    # split number and optional suffix
+    m = re.match(r'(\d+)(.*)', s)
+    if not m:
+        return s
+
+    num, suffix = m.groups()
+    return f"{int(num):02d}{suffix}"
+
+meta = pd.read_excel(
+    'data/12_flow_data_mfi/2025.2.25 IW Invasive clinical metadata.xlsx',
+    sheet_name='flow'
+)
+
+
+meta['Patient ID'] = meta['Patient ID'].apply(normalize_patient_id)
+meta['Race & Ethnicity'] = (
+    meta['Race & Ethnicity']
+      .astype(str)
+      .str.strip()          # remove leading/trailing spaces and newlines
+)
+
+print(Counter(meta['Race & Ethnicity']))
+meta
+
+df = pd.read_csv('data/12_flow_data_mfi/Ritah_FlowData_Cancer_TB.csv', index_col=0)
+df
+
+df['Patient ID'] = (
+    df.index.astype(str)
+    .str.extract(r'\]\s*([^\.\s]+)\.fcs', expand=False)
+)
+
+df['Patient ID'] = (
+    df['Patient ID'].astype(str)
+      .str.replace(r'^(\d)(\D|$)', r'0\1\2', regex=True)
+).tolist()
+
+df['Patient ID']
+
+dfp = pd.merge(
+    meta, df,
+    on='Patient ID'
+)
+
+dfp
+
+dfp = dfp[
+(dfp['Subtype']=='HR+,HER2-')
+]
+
+flowmarker_df = pd.DataFrame({
+    'celltype': [
+        col.split('|')[0][1:-1]
+        for col in df.columns
+        if col != 'Patient ID'
+    ],
+    'antibody': [
+        col.split('|')[1]
+        for col in df.columns
+        if col != 'Patient ID'
+    ]
+})
+
+flowmarker_df = flowmarker_df[
+    ~flowmarker_df['antibody'].str.startswith(('SSC', 'FSC','ViaDye'))
+]
+
+flowmarker_df['antibody'] = [x.split('___')[1] for x in flowmarker_df['antibody']]
+flowmarker_df
+
+Counter(flowmarker_df['antibody'])
+
+comb = [
+    (x,y) for x in [
+        '[Naive CD4]',
+        '[Central Memory CD4]',
+        '[Effector CD4]',
+        '[Tregs] (CD25+/CD127lo'
+    ] for y in [
+        'HLA-DR',
+        'CD279',
+        'CD152',
+        'CD366',
+        'CD223'
+    ]
+]
+comb
+
+import re
+
+cols_sel = [
+    col for col in df.columns
+    if col != 'Patient ID'
+    and any(
+        col.split('|')[0]==ct and (mk in col.split('|')[-2])
+        for ct, mk in comb
+    )
+]
+
+cols_sel = sorted(
+    cols_sel,
+    key=lambda c: next(
+        i for i, (ct, mk) in enumerate(comb)
+        if c.startswith(ct) and mk in c.split('|')[-2]
+    )
+)
+
+cols_sel
+
+from statannotations.Annotator import Annotator
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# assumes:
+# - cols_sel already exists
+# - dfp exists
+# - Annotator imported
+# - seaborn / matplotlib imported
+
+# ---------------- protein renaming ----------------
+protein_map = {
+
+    'CD274': 'PD-L1',
+    'CD38':  'CD38',
+    
+    'HLA-DR': 'HLA-DR',
+    'CD279': 'PD-1',
+    'CD152': 'CTLA-4',
+    'CD366': 'TIM-3',
+    'CD223': 'LAG-3'
+    
+}
+
+id_cols = ['Patient ID', 'Age', 'Race & Ethnicity', 'Subtype', 'Diabetes', 'Obesity']
+
+# -------- wide -> long --------
+long = (
+    dfp.loc[:, id_cols + cols_sel]
+       .melt(id_vars=id_cols, value_vars=cols_sel,
+             var_name='feature', value_name='value')
+)
+
+parts = long['feature'].astype(str).str.split('|')
+long['celltype_raw'] = parts.str[0].str.strip()
+long['celltype'] = parts.str[0].str.strip().str.strip('[]')
+long['channel'] = parts.str[1].str.strip()
+long['protein'] = long['channel'].str.split('___').str[-1]
+
+# rename proteins to biological names
+long['protein'] = long['protein'].map(lambda x: protein_map.get(x, x))
+
+long['Race & Ethnicity'] = long['Race & Ethnicity'].astype(str).str.strip()
+
+order = ['NHW', 'NHB']
+pairs = [('NHW', 'NHB')]
+
+# -------- layout: rows = cell types, cols = proteins --------
+cell_order = pd.unique(long['celltype_raw'])
+prot_order = pd.unique(long['protein'])
+
+nrows = len(cell_order)
+ncols = len(prot_order)
+
+fig, axs = plt.subplots(
+    nrows=nrows, ncols=ncols,
+    figsize=(1 * ncols, 1.2 * nrows),  # short panels
+    sharex=False, sharey=False
+)
+
+for i, cell_raw in enumerate(cell_order):
+    for j, prot in enumerate(prot_order):
+        ax = axs[i, j] if nrows > 1 else axs[j]
+
+        tmp = long[
+            (long['celltype_raw'] == cell_raw) &
+            (long['protein'] == prot)
+        ]
+
+        if tmp.empty:
+            ax.axis('off')
+            continue
+
+        sns.boxplot(
+            data=tmp, x='Race & Ethnicity', y='value',
+            hue='Race & Ethnicity', order=order,
+            dodge=False, ax=ax, fliersize=1
+        )
+        sns.stripplot(
+            data=tmp, x='Race & Ethnicity', y='value',
+            order=order, color='gray',
+            size=2, alpha=.5, dodge=False, ax=ax
+        )
+
+        annot = Annotator(
+            ax, pairs, data=tmp,
+            x='Race & Ethnicity', y='value', order=order
+        )
+        annot.configure(
+            test='Mann-Whitney',
+            text_format='star',
+            loc='inside',
+            show_test_name=False,
+            fontsize=5 
+        )
+        annot.apply_and_annotate()
+
+        if ax.get_legend() is not None:
+            ax.legend_.remove()
+
+        # titles only on top row
+        if i == 0:
+            ax.set_title(prot, fontsize=7)
+
+        # y-label only on first column
+        if j == 0:
+            pretty = cell_raw.replace('[Tregs] (CD25+/CD127lo', 'Treg').strip('[]')
+            ax.set_ylabel(f'{pretty}\nMFI', fontsize=6)
+        else:
+            ax.set_ylabel('')
+
+        ax.set_xlabel('')
+        ax.tick_params(axis='x', labelsize=6)
+        ax.tick_params(axis='y', labelsize=5)
+
+plt.tight_layout()
+plt.savefig('plots/S7_3/MFI_CD4T.pdf',
+            bbox_inches='tight')
+plt.show()
+
+
+
+comb = [
+    (x,y) for x in [
+        '[Naive B]',
+        '{CD20+ B cells}',
+        '[Unswitched Memory B]',
+        '[Switched Memory B]',
+        '[Plasmablasts]'
+    ] for y in [
+        'HLA-DR',
+        'CD197',
+        'CD185'
+    ]
+]
+comb
+
+import re
+
+cols_sel = [
+    col for col in df.columns
+    if col != 'Patient ID'
+    and any(
+        col.split('|')[0]==ct and (mk in col.split('|')[-2])
+        for ct, mk in comb
+    )
+]
+
+cols_sel = sorted(
+    cols_sel,
+    key=lambda c: next(
+        i for i, (ct, mk) in enumerate(comb)
+        if c.startswith(ct) and mk in c.split('|')[-2]
+    )
+)
+
+cols_sel
+
+from statannotations.Annotator import Annotator
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# assumes:
+# - cols_sel already exists
+# - dfp exists
+# - Annotator imported
+# - seaborn / matplotlib imported
+
+# ---------------- protein renaming ----------------
+protein_map = {
+    
+    'HLA-DR': 'HLA-DR',
+    'CD197': 'CCR7',
+    'CD185': 'CXCR5'
+    
+}
+
+id_cols = ['Patient ID', 'Age', 'Race & Ethnicity', 'Subtype', 'Diabetes', 'Obesity']
+
+# -------- wide -> long --------
+long = (
+    dfp.loc[:, id_cols + cols_sel]
+       .melt(id_vars=id_cols, value_vars=cols_sel,
+             var_name='feature', value_name='value')
+)
+
+parts = long['feature'].astype(str).str.split('|')
+long['celltype_raw'] = parts.str[0].str.strip()
+long['celltype'] = parts.str[0].str.strip().str.strip('[]')
+long['channel'] = parts.str[1].str.strip()
+long['protein'] = long['channel'].str.split('___').str[-1]
+
+# rename proteins to biological names
+long['protein'] = long['protein'].map(lambda x: protein_map.get(x, x))
+
+long['Race & Ethnicity'] = long['Race & Ethnicity'].astype(str).str.strip()
+
+order = ['NHW', 'NHB']
+pairs = [('NHW', 'NHB')]
+
+# -------- layout: rows = cell types, cols = proteins --------
+cell_order = pd.unique(long['celltype_raw'])
+prot_order = pd.unique(long['protein'])
+
+nrows = len(cell_order)
+ncols = len(prot_order)
+
+fig, axs = plt.subplots(
+    nrows=nrows, ncols=ncols,
+    figsize=(1.1 * ncols, 1.2 * nrows),  # short panels
+    sharex=False, sharey=False
+)
+
+for i, cell_raw in enumerate(cell_order):
+    for j, prot in enumerate(prot_order):
+        ax = axs[i, j] if nrows > 1 else axs[j]
+
+        tmp = long[
+            (long['celltype_raw'] == cell_raw) &
+            (long['protein'] == prot)
+        ]
+
+        if tmp.empty:
+            ax.axis('off')
+            continue
+
+        sns.boxplot(
+            data=tmp, x='Race & Ethnicity', y='value',
+            hue='Race & Ethnicity', order=order,
+            dodge=False, ax=ax, fliersize=1
+        )
+        sns.stripplot(
+            data=tmp, x='Race & Ethnicity', y='value',
+            order=order, color='gray',
+            size=2, alpha=.5, dodge=False, ax=ax
+        )
+
+        annot = Annotator(
+            ax, pairs, data=tmp,
+            x='Race & Ethnicity', y='value', order=order
+        )
+        annot.configure(
+            test='Mann-Whitney',
+            text_format='star',
+            loc='inside',
+            show_test_name=False,
+            fontsize=5 
+        )
+        annot.apply_and_annotate()
+
+        if ax.get_legend() is not None:
+            ax.legend_.remove()
+
+        # titles only on top row
+        if i == 0:
+            ax.set_title(prot, fontsize=7)
+
+        # y-label only on first column
+        if j == 0:
+            pretty = cell_raw.replace('[Tregs] (CD25+/CD127lo', 'Treg').strip('[]')
+            ax.set_ylabel(f'{pretty}\nMFI', fontsize=6)
+        else:
+            ax.set_ylabel('')
+
+        ax.set_xlabel('')
+        ax.tick_params(axis='x', labelsize=6)
+        ax.tick_params(axis='y', labelsize=5)
+
+plt.tight_layout()
+plt.savefig('plots/S7_3/MFI_Bcells.pdf',
+            bbox_inches='tight')
+plt.show()
+
+
+
