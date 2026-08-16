@@ -50,7 +50,7 @@ def read_gmt(fpath):
 def write_gmt(gdict, fpath):
     with open(fpath, 'w') as f:
         for key, val in gdict.items():
-            f.write(f"{key}\thttp\t{'\t'.join(val)}\n")
+            f.write(f"{key}\t{key}\t{'\t'.join(val)}\n")
     print(f"finished writing {len(gdict)} gene sets to {fpath}")
 
 # Additional plotting functions preserved as-is from the original due to complexity. If needed, they can be modularized in a separate file.
